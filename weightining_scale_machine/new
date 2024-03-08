@@ -3,17 +3,21 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <BluetoothSerial.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
 
 #define HX711_DOUT_PIN 21   // Connect DOUT pin of HX711 to pin 21 on ESP32
 #define HX711_CLK_PIN  22   // Connect CLK pin of HX711 to pin 22 on ESP32
-
-#define OLED_SDA_PIN 4     // Connect SDA pin of OLED to pin 4 on ESP32
-#define OLED_SCL_PIN 5     // Connect SCL pin of OLED to pin 5 on ESP32
+#define OLED_SDA_PIN 4      // Connect SDA pin of OLED to pin 4 on ESP32
+#define OLED_SCL_PIN 5      // Connect SCL pin of OLED to pin 5 on ESP32
 
 BluetoothSerial SerialBT;
 
 HX711 scale;
-
 float weight;
 float calibration_factor = 2471.24;  // Adjust this value for calibration
 
@@ -22,70 +26,167 @@ float calibration_factor = 2471.24;  // Adjust this value for calibration
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1); // Use default Wire for ESP32
 
+BLEServer* pServer = NULL;
+BLECharacteristic* pSensorCharacteristic = NULL;
+BLECharacteristic* pLedCharacteristic = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+uint32_t bluetoothValue = 0;
+
+const int ledPin = 2; // Use the appropriate GPIO pin for your setup
+
+#define SERVICE_UUID        "19b10000-e8f2-537e-4f6c-d104768a1214"
+#define SENSOR_CHARACTERISTIC_UUID "19b10001-e8f2-537e-4f6c-d104768a1214"
+#define LED_CHARACTERISTIC_UUID "19b10002-e8f2-537e-4f6c-d104768a1214"
+
+AsyncWebServer server(80);
+
+class MyServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        deviceConnected = true;
+    }
+
+    void onDisconnect(BLEServer* pServer) {
+        deviceConnected = false;
+    }
+};
+
+class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* pLedCharacteristic) {
+        std::string value = pLedCharacteristic->getValue();
+        if (value.length() > 0) {
+            int receivedValue = static_cast<int>(value[0]);
+            if (receivedValue == 1) {
+                digitalWrite(ledPin, HIGH);
+            } else {
+                digitalWrite(ledPin, LOW);
+            }
+        }
+    }
+};
+
 void setup() {
-  Serial.begin(115200);
-  SerialBT.begin("ESP32_BT_Scale");  // Set the Bluetooth name for your ESP32
+    Serial.begin(115200);
+    SerialBT.begin("ESP32_BT_Scale");
 
-  Serial.println("HX711 calibration sketch");
-  Serial.println("Remove all weight from scale");
-  Serial.println("After readings begin, place a known weight on the scale");
-  Serial.println("Press + or a to increase the calibration factor");
-  Serial.println("Press - or z to decrease the calibration factor");
+    // Set up the HX711 with DOUT and CLK pins
+    scale.begin(HX711_DOUT_PIN, HX711_CLK_PIN);
 
-  // Set up the HX711 with DOUT and CLK pins
-  scale.begin(HX711_DOUT_PIN, HX711_CLK_PIN);
+    scale.set_scale();
+    scale.tare();
+    long zero_factor = scale.read_average();
+    Serial.print("Zero factor: ");
+    Serial.println(zero_factor);
 
-  scale.set_scale();
-  scale.tare();  // Reset the scale to 0
-  long zero_factor = scale.read_average();  // Get a baseline reading
-  Serial.print("Zero factor: ");
-  Serial.println(zero_factor);
+    // Set up the OLED display with SDA and SCL pins
+    Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+    display.begin(SSD1306_SWITCHCAPVCC, 0x3C, true, true);
+    delay(2000);
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
 
-  // Set up the OLED display with SDA and SCL pins
-  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C, true, true);
-  delay(2000);
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
+    // Create the BLE Device
+    BLEDevice::init("ESP32");
+
+    // Create the BLE Server
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+
+    // Create the BLE Service
+    BLEService* pService = pServer->createService(SERVICE_UUID);
+
+    // Create a BLE Characteristic
+    pSensorCharacteristic = pService->createCharacteristic(
+        SENSOR_CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_READ |
+            BLECharacteristic::PROPERTY_WRITE |
+            BLECharacteristic::PROPERTY_NOTIFY |
+            BLECharacteristic::PROPERTY_INDICATE);
+
+    // Create the ON button Characteristic
+    pLedCharacteristic = pService->createCharacteristic(
+        LED_CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_WRITE);
+
+    // Register the callback for the ON button characteristic
+    pLedCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+
+    // Add BLE descriptors
+    pSensorCharacteristic->addDescriptor(new BLE2902());
+    pLedCharacteristic->addDescriptor(new BLE2902());
+
+    // Start the BLE service
+    pService->start();
+
+    // Start advertising
+    BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(false);
+    pAdvertising->setMinPreferred(0x0);
+    BLEDevice::startAdvertising();
+
+    // Web server setup
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+        String html = "<html><body>";
+        html += "<h1>ESP32 Bluetooth Scale</h1>";
+        html += "<p>Weight: " + String(weight) + " g</p>";
+        html += "<p>Bluetooth Value: " + String(bluetoothValue) + "</p>";
+        html += "</body></html>";
+        request->send(200, "text/html", html);
+    });
+
+    server.begin();
+    Serial.println("HTTP server started");
 }
 
 void loop() {
-  scale.set_scale(calibration_factor);
-  Serial.print("Reading: ");
-  weight = scale.get_units(5);
+    // Bluetooth - notify changed value
+    if (deviceConnected) {
+        pSensorCharacteristic->setValue(String(weight).c_str());
+        pSensorCharacteristic->notify();
+        bluetoothValue++;
+        Serial.print("Bluetooth Value notified: ");
+        Serial.println(bluetoothValue);
+        delay(3000);
+    }
 
-  // Ensure the weight is non-negative
-  if (weight < 0) {
-    weight = 0.00;
-  }
+    // Web server - update weight
+    scale.set_scale(calibration_factor);
+    weight = scale.get_units(5);
 
-  Serial.print("Grams: ");
-  Serial.print(weight);
-  Serial.print(" g");
-  Serial.print(" Calibration Factor: ");
-  Serial.print(calibration_factor);
-  Serial.println();
+    if (weight < 0) {
+        weight = 0.00;
+    }
 
-  // Send the weight information over Bluetooth
-  SerialBT.print("Weight: ");
-  SerialBT.print(weight);
-  SerialBT.println(" g");
+    // Display on OLED
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    display.print("ESP32 Scale");
 
-  display.clearDisplay();
-  display.setTextSize(2); // Reduced font size
-  display.setCursor(0, 0);
-  display.print("EyePhy AG ");
+    int16_t weightTextWidth = display.getCursorX();
+    display.setTextSize(2);
+    display.print(weight);
 
-  // Calculate the width of the weight text
-  int16_t weightTextWidth = display.getCursorX();
-  display.setTextSize(2); // Reduced font size
-  display.print(weight);
+    display.setCursor(weightTextWidth, 25);
+    display.setTextSize(2);
+    display.print("grams");
 
-  // Adjust the cursor position for the 'g' based on the width of the weight text
-  display.setCursor(weightTextWidth, 25);
-  display.setTextSize(2); // Reduced font size
-  display.print("grams");
+    display.display();
+    delay(100);
 
-  display.display();
-  delay(100);
+    // Disconnecting
+    if (!deviceConnected && oldDeviceConnected) {
+        Serial.println("Device disconnected.");
+        delay(500);
+        pServer->startAdvertising();
+        Serial.println("Start advertising");
+        oldDeviceConnected = deviceConnected;
+    }
+
+    // Connecting
+    if (deviceConnected && !oldDeviceConnected) {
+        oldDeviceConnected = deviceConnected;
+        Serial.println("Device Connected");
+    }
 }
